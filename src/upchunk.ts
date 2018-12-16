@@ -1,4 +1,5 @@
 import { EventTarget } from 'event-target-shim';
+import GCS from './UpChunk/strategies/GCS';
 
 const SUCCESSFUL_CHUNK_UPLOAD_CODES = [200, 201, 202, 204, 308];
 const TEMPORARY_ERROR_CODES = [408, 502, 503, 504]; // These error codes imply a chunk may be retried
@@ -6,28 +7,64 @@ const TEMPORARY_ERROR_CODES = [408, 502, 503, 504]; // These error codes imply a
 type EventName =
   | 'attempt'
   | 'attemptFailure'
+  | 'chunkUploaded'
   | 'error'
   | 'offline'
   | 'online'
   | 'progress'
-  | 'success';
+  | 'success'
+  | 'pause'
+  | 'resume';
+
+type IEndpoint = string | ((file?: File) => Promise<string>);
+
+export interface IUploadResponse {
+  response: Response;
+  success: boolean;
+  uploadComplete: boolean;
+  index: number;
+  chunk: Blob;
+  headers: Headers;
+}
+export interface IUpload {
+  (
+    endpoint: string,
+    chunkDetails: IChunkDetails,
+    chunk: Blob,
+    file: File,
+    headers: Headers
+  ): Promise<IUploadResponse>;
+}
 
 interface IOptions {
-  endpoint: string | ((file?: File) => Promise<string>);
+  endpoint: IEndpoint;
   file: File;
   headers?: Headers;
   chunkSize?: number;
   attempts?: number;
   delayBeforeAttempt?: number;
+  upload?: IUpload;
 }
 
-export class UpChunk {
-  public endpoint: string | ((file?: File) => Promise<string>);
+export interface IChunkDetails {
+  index: number;
+  attempting: boolean;
+  start: number;
+  end: number;
+  size: number;
+  uploaded: boolean;
+  attempts: number;
+  timing?: number;
+}
+
+export class UpChunk implements IOptions {
+  public endpoint: IEndpoint;
   public file: File;
   public headers: Headers;
   public chunkSize: number;
   public attempts: number;
   public delayBeforeAttempt: number;
+  public upload: IUpload;
 
   private chunk: Blob;
   private chunkCount: number;
@@ -37,6 +74,7 @@ export class UpChunk {
   private attemptCount: number;
   private offline: boolean;
   private paused: boolean;
+  private chunkDetails: IChunkDetails[];
 
   private reader: FileReader;
   private eventTarget: EventTarget;
@@ -48,6 +86,7 @@ export class UpChunk {
     this.chunkSize = options.chunkSize || 5120;
     this.attempts = options.attempts || 5;
     this.delayBeforeAttempt = options.delayBeforeAttempt || 1;
+    this.upload = options.upload || GCS.upload;
 
     this.chunkCount = 0;
     this.chunkByteSize = this.chunkSize * 1024;
@@ -55,12 +94,15 @@ export class UpChunk {
     this.attemptCount = 0;
     this.offline = false;
     this.paused = false;
+    this.chunkDetails = [];
 
     this.reader = new FileReader();
     this.eventTarget = new EventTarget();
 
     this.validateOptions();
-    this.getEndpoint().then(() => this.sendChunks());
+    this.getEndpoint()
+      .then(() => this.buildChunkArray())
+      .then(() => this.sendChunks());
 
     // restart sync when back online
     // trigger events when offline/back online
@@ -87,15 +129,45 @@ export class UpChunk {
     this.eventTarget.addEventListener(eventName, fn);
   }
 
+  public done() {
+    this;
+  }
+
   public pause() {
+    if (this.paused) return;
+
     this.paused = true;
+    this.dispatch('pause');
   }
 
   public resume() {
-    if (this.paused) {
-      this.paused = false;
+    if (!this.paused) return;
+    this.paused = false;
+    this.dispatch('resume');
 
-      this.sendChunks();
+    this.sendChunks();
+  }
+
+  private buildChunkArray() {
+    for (let i = 0; i < this.totalChunks; i = i + 1) {
+      const start = i * this.chunkByteSize;
+      // for the last chunk we just need to have it be the remainder of the file.
+      const size =
+        i + 1 === this.totalChunks
+          ? this.file.size - this.chunkByteSize * i
+          : this.chunkByteSize;
+      this.chunkDetails = [
+        ...this.chunkDetails,
+        {
+          start,
+          size,
+          end: start + size,
+          index: i,
+          uploaded: false,
+          attempts: 0,
+          attempting: false,
+        },
+      ];
     }
   }
 
@@ -166,15 +238,26 @@ export class UpChunk {
     });
   }
 
+  private updateChunkDetails(index: number, update: Partial<IChunkDetails>) {
+    this.chunkDetails[index] = { ...this.chunkDetails[index], ...update };
+
+    return this.chunkDetails[index];
+  }
+
   /**
    * Get portion of the file of x bytes corresponding to chunkSize
    */
-  private getChunk() {
-    return new Promise(resolve => {
-      // Since we start with 0-chunkSize for the range, we need to subtract 1.
-      const length =
-        this.totalChunks === 1 ? this.file.size : this.chunkByteSize;
-      const start = length * this.chunkCount;
+  private getChunk(): Promise<IChunkDetails> {
+    return new Promise((resolve, reject) => {
+      const nextChunkIndex = this.chunkDetails.findIndex(
+        chunk => !chunk.uploaded && !chunk.attempting
+      );
+
+      if (nextChunkIndex < 0) reject('no_chunks_available');
+
+      const nextChunk = this.updateChunkDetails(nextChunkIndex, {
+        attempting: true,
+      });
 
       this.reader.onload = () => {
         if (this.reader.result !== null) {
@@ -182,36 +265,32 @@ export class UpChunk {
             type: 'application/octet-stream',
           });
         }
-        resolve();
+        resolve(nextChunk);
       };
 
-      this.reader.readAsArrayBuffer(this.file.slice(start, start + length));
+      this.reader.readAsArrayBuffer(
+        this.file.slice(nextChunk.start, nextChunk.end)
+      );
     });
   }
 
   /**
    * Send chunk of the file with appropriate headers and add post parameters if it's last chunk
    */
-  private sendChunk() {
-    const rangeStart = this.chunkCount * this.chunkByteSize;
-    const rangeEnd = rangeStart + this.chunk.size - 1;
-    const headers = {
-      ...this.headers,
-      'Content-Type': this.file.type,
-      'Content-Length': this.chunk.size,
-      'Content-Range': `bytes ${rangeStart}-${rangeEnd}/${this.file.size}`,
-    };
+  private async sendChunk(chunkDetails: IChunkDetails) {
+    this.dispatch('attempt', chunkDetails);
 
-    this.dispatch('attempt', {
-      chunkNumber: this.chunkCount,
-      chunkSize: this.chunk.size,
-    });
+    const attemptDetails = await this.upload(
+      this.endpointValue,
+      chunkDetails,
+      this.chunk,
+      this.file,
+      this.headers
+    );
 
-    return fetch(this.endpointValue, {
-      headers,
-      method: 'PUT',
-      body: this.chunk,
-    });
+    this.dispatch('chunkUploaded', attemptDetails);
+
+    return attemptDetails;
   }
 
   /**
@@ -243,46 +322,38 @@ export class UpChunk {
    * Manage the whole upload by calling getChunk & sendChunk
    * handle errors & retries and dispatch events
    */
-  private sendChunks() {
+  private async sendChunks() {
     if (this.paused || this.offline) {
       return;
     }
 
     this.getChunk()
-      .then(() => this.sendChunk())
-      .then(res => {
-        if (SUCCESSFUL_CHUNK_UPLOAD_CODES.includes(res.status)) {
-          this.chunkCount = this.chunkCount + 1;
-          if (this.chunkCount < this.totalChunks) {
-            this.sendChunks();
-          } else {
-            this.dispatch('success');
-          }
-
-          const percentProgress = Math.round(
-            (100 / this.totalChunks) * this.chunkCount
-          );
-
-          this.dispatch('progress', percentProgress);
-        } else if (TEMPORARY_ERROR_CODES.includes(res.status)) {
-          if (this.paused || this.offline) {
-            return;
-          }
-          this.manageRetries();
-        } else {
-          if (this.paused || this.offline) {
-            return;
-          }
-
-          this.dispatch('error', {
-            message: `Server responded with ${res.status}. Stopping upload.`,
-            chunkNumber: this.chunkCount,
-            attempts: this.attemptCount,
-          });
+      .then(chunkDetails => this.sendChunk(chunkDetails))
+      .then(attemptDetails => {
+        if (attemptDetails.uploadComplete) {
+          return this.dispatch('success');
         }
+
+        this.chunkCount = this.chunkCount + 1;
+
+        this.sendChunks();
+        const percentProgress = Math.round(
+          (100 / this.totalChunks) * attemptDetails.index
+        );
+
+        this.dispatch('progress', percentProgress);
       })
       .catch(err => {
-        if (this.paused || this.offline) {
+        if (err === 'no_chunks_available' || this.paused || this.offline) {
+          return;
+        }
+
+        if (err.details && !err.details.shouldRetry) {
+          this.dispatch('error', {
+            ...err.details,
+            message: `Server responded with an unrecoverable error. Stopping upload.`,
+          });
+
           return;
         }
 
