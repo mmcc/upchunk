@@ -5,7 +5,9 @@ const CHUNK_SUCCESS_CODES = [308];
 const FILE_SUCCESS_CODES = [200, 201];
 const TEMPORARY_ERROR_CODES = [408, 502, 503, 504];
 
-const GCS = {
+export const resumable = {
+  chunkSize: 5120,
+  maxParralelRequests: 1,
   upload(
     endpoint: string,
     chunkDetails: IChunkDetails,
@@ -52,5 +54,3 @@ const GCS = {
     });
   },
 };
-
-export default GCS;

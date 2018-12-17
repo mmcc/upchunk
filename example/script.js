@@ -7,6 +7,7 @@ picker.onchange = () => {
     endpoint,
     file,
     chunkSize: 5120,
+    maxParallelRequests: 1,
   });
 
   // subscribe to events

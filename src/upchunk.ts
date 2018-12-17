@@ -1,5 +1,5 @@
 import { EventTarget } from 'event-target-shim';
-import GCS from './UpChunk/strategies/GCS';
+import * as GCS from './UpChunk/strategies/GCS';
 
 const SUCCESSFUL_CHUNK_UPLOAD_CODES = [200, 201, 202, 204, 308];
 const TEMPORARY_ERROR_CODES = [408, 502, 503, 504]; // These error codes imply a chunk may be retried
@@ -44,7 +44,8 @@ interface IOptions {
   attempts?: number;
   delayBeforeAttempt?: number;
   upload?: IUpload;
-  maxParallelRequests: number;
+  maxParallelRequests?: number;
+  strategy: IOptions;
 }
 
 export interface IChunkDetails {
@@ -68,8 +69,8 @@ export class UpChunk implements IOptions {
   public delayBeforeAttempt: number;
   public upload: IUpload;
   public maxParallelRequests: number;
+  public strategy: IOptions;
 
-  private chunk: Blob;
   private chunkCount: number;
   private chunkByteSize: number;
   private endpointValue: string;
@@ -82,14 +83,17 @@ export class UpChunk implements IOptions {
   private reader: FileReader;
   private eventTarget: EventTarget;
 
-  constructor(options: IOptions) {
+  constructor(userOptions: IOptions) {
+    this.strategy = userOptions.strategy || GCS.resumable;
+    const options = { ...this.strategy, userOptions };
+
     this.endpoint = options.endpoint;
     this.file = options.file;
     this.headers = options.headers || ({} as Headers);
     this.chunkSize = options.chunkSize || 5120;
     this.attempts = options.attempts || 5;
     this.delayBeforeAttempt = options.delayBeforeAttempt || 1;
-    this.upload = options.upload || GCS.upload;
+    this.upload = options.upload || GCS.resumable.upload;
     this.maxParallelRequests = options.maxParallelRequests || 3;
 
     this.chunkCount = 0;
@@ -344,14 +348,13 @@ export class UpChunk implements IOptions {
    * handle errors & retries and dispatch events
    */
   private async sendChunks(count: number) {
-    // let chunkArray: IChunkDetails[] = [];
-    // for (let i = 0; i < count; i = i + 1) {
-    //   const chunk = await this.getChunk();
-    //   chunkArray = [...chunkArray, chunk];
-    // }
+    let chunkArray: IChunkDetails[] = [];
+    for (let i = 0; i < count; i = i + 1) {
+      const chunk = await this.getChunk();
+      chunkArray = [...chunkArray, chunk];
+    }
 
-    // return chunkArray.map(chunk => this.chunkSender(chunk));
-    return this.getChunk().then(chunk => this.chunkSender(chunk));
+    return chunkArray.map(chunk => this.chunkSender(chunk));
   }
 
   private chunkSender(chunk: IChunkDetails) {
