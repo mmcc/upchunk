@@ -44,6 +44,7 @@ interface IOptions {
   attempts?: number;
   delayBeforeAttempt?: number;
   upload?: IUpload;
+  maxParallelRequests: number;
 }
 
 export interface IChunkDetails {
@@ -55,6 +56,7 @@ export interface IChunkDetails {
   uploaded: boolean;
   attempts: number;
   timing?: number;
+  blob?: Blob;
 }
 
 export class UpChunk implements IOptions {
@@ -65,6 +67,7 @@ export class UpChunk implements IOptions {
   public attempts: number;
   public delayBeforeAttempt: number;
   public upload: IUpload;
+  public maxParallelRequests: number;
 
   private chunk: Blob;
   private chunkCount: number;
@@ -87,6 +90,7 @@ export class UpChunk implements IOptions {
     this.attempts = options.attempts || 5;
     this.delayBeforeAttempt = options.delayBeforeAttempt || 1;
     this.upload = options.upload || GCS.upload;
+    this.maxParallelRequests = options.maxParallelRequests || 3;
 
     this.chunkCount = 0;
     this.chunkByteSize = this.chunkSize * 1024;
@@ -102,7 +106,7 @@ export class UpChunk implements IOptions {
     this.validateOptions();
     this.getEndpoint()
       .then(() => this.buildChunkArray())
-      .then(() => this.sendChunks());
+      .then(() => this.sendChunks(this.maxParallelRequests));
 
     // restart sync when back online
     // trigger events when offline/back online
@@ -113,7 +117,7 @@ export class UpChunk implements IOptions {
 
       this.offline = false;
       this.dispatch('online');
-      this.sendChunks();
+      this.sendChunks(this.maxParallelRequests);
     });
 
     window.addEventListener('offline', () => {
@@ -145,7 +149,7 @@ export class UpChunk implements IOptions {
     this.paused = false;
     this.dispatch('resume');
 
-    this.sendChunks();
+    this.sendChunks(this.maxParallelRequests);
   }
 
   private buildChunkArray() {
@@ -221,6 +225,12 @@ export class UpChunk implements IOptions {
     ) {
       throw new TypeError('delayBeforeAttempt must be a positive number');
     }
+    if (
+      typeof this.maxParallelRequests !== 'number' ||
+      this.maxParallelRequests < 0
+    ) {
+      throw new TypeError('maxParallelRequests must be a positive number');
+    }
   }
 
   /**
@@ -253,17 +263,25 @@ export class UpChunk implements IOptions {
         chunk => !chunk.uploaded && !chunk.attempting
       );
 
-      if (nextChunkIndex < 0) reject('no_chunks_available');
+      if (nextChunkIndex < 0) {
+        if (this.chunkDetails.findIndex(chunk => chunk.attempting) >= 0) {
+          return reject('no_chunks_available');
+        }
 
-      const nextChunk = this.updateChunkDetails(nextChunkIndex, {
+        return reject('no_chunks');
+      }
+
+      let nextChunk = this.updateChunkDetails(nextChunkIndex, {
         attempting: true,
       });
 
       this.reader.onload = () => {
         if (this.reader.result !== null) {
-          this.chunk = new Blob([this.reader.result], {
+          const blob = new Blob([this.reader.result], {
             type: 'application/octet-stream',
           });
+
+          nextChunk = { ...nextChunk, blob };
         }
         resolve(nextChunk);
       };
@@ -278,12 +296,15 @@ export class UpChunk implements IOptions {
    * Send chunk of the file with appropriate headers and add post parameters if it's last chunk
    */
   private async sendChunk(chunkDetails: IChunkDetails) {
+    // Improve this error or figure out why it's needing to be guarded here.
+    if (!chunkDetails.blob) throw Error();
+
     this.dispatch('attempt', chunkDetails);
 
     const attemptDetails = await this.upload(
       this.endpointValue,
       chunkDetails,
-      this.chunk,
+      chunkDetails.blob,
       this.file,
       this.headers
     );
@@ -299,7 +320,7 @@ export class UpChunk implements IOptions {
   private manageRetries() {
     if (this.attemptCount < this.attempts) {
       this.attemptCount = this.attemptCount + 1;
-      setTimeout(() => this.sendChunks(), this.delayBeforeAttempt * 1000);
+      setTimeout(() => this.sendChunks(1), this.delayBeforeAttempt * 1000);
       this.dispatch('attemptFailure', {
         message: `An error occured uploading chunk ${this.chunkCount}. ${this
           .attempts - this.attemptCount} retries left.`,
@@ -322,13 +343,23 @@ export class UpChunk implements IOptions {
    * Manage the whole upload by calling getChunk & sendChunk
    * handle errors & retries and dispatch events
    */
-  private async sendChunks() {
-    if (this.paused || this.offline) {
+  private async sendChunks(count: number) {
+    // let chunkArray: IChunkDetails[] = [];
+    // for (let i = 0; i < count; i = i + 1) {
+    //   const chunk = await this.getChunk();
+    //   chunkArray = [...chunkArray, chunk];
+    // }
+
+    // return chunkArray.map(chunk => this.chunkSender(chunk));
+    return this.getChunk().then(chunk => this.chunkSender(chunk));
+  }
+
+  private chunkSender(chunk: IChunkDetails) {
+    if (!chunk.blob || this.paused || this.offline) {
       return;
     }
 
-    this.getChunk()
-      .then(chunkDetails => this.sendChunk(chunkDetails))
+    this.sendChunk(chunk)
       .then(attemptDetails => {
         if (attemptDetails.uploadComplete) {
           return this.dispatch('success');
@@ -336,7 +367,7 @@ export class UpChunk implements IOptions {
 
         this.chunkCount = this.chunkCount + 1;
 
-        this.sendChunks();
+        this.sendChunks(1);
         const percentProgress = Math.round(
           (100 / this.totalChunks) * attemptDetails.index
         );
@@ -344,7 +375,7 @@ export class UpChunk implements IOptions {
         this.dispatch('progress', percentProgress);
       })
       .catch(err => {
-        if (err === 'no_chunks_available' || this.paused || this.offline) {
+        if (err === 'no_chunks' || this.paused || this.offline) {
           return;
         }
 
