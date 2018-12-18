@@ -45,7 +45,7 @@ interface IOptions {
   delayBeforeAttempt?: number;
   upload?: IUpload;
   maxParallelRequests?: number;
-  strategy: IOptions;
+  strategy?: Partial<IOptions>;
 }
 
 export interface IChunkDetails {
@@ -69,7 +69,7 @@ export class UpChunk implements IOptions {
   public delayBeforeAttempt: number;
   public upload: IUpload;
   public maxParallelRequests: number;
-  public strategy: IOptions;
+  public strategy: Partial<IOptions>;
 
   private chunkCount: number;
   private chunkByteSize: number;
@@ -84,11 +84,11 @@ export class UpChunk implements IOptions {
   private eventTarget: EventTarget;
 
   constructor(userOptions: IOptions) {
+    this.endpoint = userOptions.endpoint;
+    this.file = userOptions.file;
     this.strategy = userOptions.strategy || GCS.resumable;
     const options = { ...this.strategy, userOptions };
 
-    this.endpoint = options.endpoint;
-    this.file = options.file;
     this.headers = options.headers || ({} as Headers);
     this.chunkSize = options.chunkSize || 5120;
     this.attempts = options.attempts || 5;
